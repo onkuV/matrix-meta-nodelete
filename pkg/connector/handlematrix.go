@@ -55,6 +55,18 @@ var (
 
 const ConnectWaitTimeout = 1 * time.Minute
 
+// wrapServerRejection turns Meta's terse optimistic-send failure (typically
+// "Couldn't send.") into a user-facing notice. When Meta also reports a thread
+// subscription error, the send is not retryable: the account can no longer post
+// to the chat, so spell out the likely reason instead of only echoing Meta's
+// string.
+func wrapServerRejection(metaMessage string, subscriptErr bool) error {
+	if subscriptErr {
+		return fmt.Errorf("%w: %s (you may no longer be a member of this chat, or posting may be restricted to admins)", ErrServerRejectedMessage, metaMessage)
+	}
+	return fmt.Errorf("%w: %s", ErrServerRejectedMessage, metaMessage)
+}
+
 func getOTID(inputTxnID networkid.RawTransactionID) int64 {
 	if inputTxnID != "" {
 		otid, err := strconv.ParseInt(string(inputTxnID), 10, 64)
@@ -173,10 +185,28 @@ func (m *MetaClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matr
 				}
 			}
 			if len(msgID) == 0 {
-				log.Warn().Any("response", resp).Msg("Message send response didn't include message ID")
+				// Meta rejected the optimistic send. A subscription error on the
+				// thread means the account can no longer post to it (removed from
+				// the group, admin-only posting, etc.) rather than a transient
+				// failure, so capture that signal for both logging and the notice.
+				subscriptErr := false
+				for _, se := range resp.LSUpdateSubscriptErrorMessage {
+					subscriptErr = true
+					log.Warn().
+						Int64("thread_key", se.ThreadKey).
+						Str("message", se.Message).
+						Msg("Meta reported a thread subscription error while sending")
+				}
+				log.Warn().
+					Any("response", resp).
+					Bool("subscript_error", subscriptErr).
+					Msg("Message send response didn't include message ID")
 				for _, failed := range resp.LSMarkOptimisticMessageFailed {
-					log.Warn().Str("message", failed.Message).Msg("Sending message failed (optimistic)")
-					return nil, fmt.Errorf("%w: %s", ErrServerRejectedMessage, failed.Message)
+					log.Warn().
+						Str("message", failed.Message).
+						Bool("subscript_error", subscriptErr).
+						Msg("Sending message failed (optimistic)")
+					return nil, wrapServerRejection(failed.Message, subscriptErr)
 				}
 				for _, failed := range resp.LSHandleFailedTask {
 					log.Warn().Str("message", failed.Message).Msg("Sending message failed (task)")
